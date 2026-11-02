@@ -1,0 +1,61 @@
+# project.yml
+name: Parasite
+options:
+  bundleIdPrefix: com.venice
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    TARGETED_DEVICE_FAMILY: "1,2"
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Parasite-Bridging-Header.h
+    CODE_SIGNING_ALLOWED: "NO"
+
+targets:
+  Parasite:
+    type: application
+    platform: iOS
+    dependencies:
+      - framework: ImageIO.framework
+        embed: false
+      - framework: CoreGraphics.framework
+        embed: false
+      - framework: CoreText.framework
+        embed: false
+      - framework: AudioToolbox.framework
+        embed: false
+      - framework: PDFKit.framework
+        embed: false
+      - framework: CoreMedia.framework
+        embed: false
+    sources:
+      - path: Sources
+        excludes:
+          - "Info.plist"
+    resources:
+      - path: Resources
+        excludes:
+          - "Info.plist"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Parasite
+        CFBundleName: Parasite
+        CFBundleIdentifier: com.venice.Parasite
+        CFBundleVersion: "1"
+        CFBundleShortVersionString: "1.0"
+        CFBundlePackageType: APPL
+        CFBundleExecutable: Parasite
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UILaunchScreen: {}
