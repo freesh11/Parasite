@@ -144,15 +144,68 @@ jobs:
           ls -lh rootfs.dmg
           file rootfs.dmg
 
-      - name: Mount DMG and extract CoreMedia
+      - name: Inspect and mount DMG
         run: |
-          hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS || \
+          ls -lh rootfs.dmg
+          file rootfs.dmg
+          xxd rootfs.dmg | head -4  # magic bytes
+
+          # Try all known mount strategies
+          mount_ok=0
+
+          # 1. Standard
+          hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS 2>&1 && mount_ok=1 || true
+
+          # 2. Raw disk image (common for iOS root FS)
+          if [ $mount_ok -eq 0 ]; then
             hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS \
-              -imagekey diskimage-class=CRawDiskImage
-          cp /Volumes/iOS_FS/System/Library/Frameworks/CoreMedia.framework/CoreMedia ./CoreMedia
-          hdiutil detach /Volumes/iOS_FS
-          ls -lh CoreMedia
-          file CoreMedia
+              -imagekey diskimage-class=CRawDiskImage 2>&1 && mount_ok=1 || true
+          fi
+
+          # 3. APFS inside DMG
+          if [ $mount_ok -eq 0 ]; then
+            hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS \
+              -imagekey diskimage-class=CRawDiskImage \
+              -imagekey apple-apfs-recover=YES 2>&1 && mount_ok=1 || true
+          fi
+
+          if [ $mount_ok -eq 0 ]; then
+            echo "hdiutil failed — trying to extract CoreMedia with 7z directly"
+            brew install p7zip 2>/dev/null || true
+            # IPSW DMGs are sometimes just zips themselves
+            7z l rootfs.dmg 2>&1 | head -30 || true
+            echo "mount_ok=0 — will try dyld_shared_cache extraction below"
+          fi
+
+          # Extract CoreMedia if mounted
+          if [ $mount_ok -eq 1 ]; then
+            ls /Volumes/iOS_FS/System/Library/Frameworks/ 2>&1 | head -10 || true
+            cp /Volumes/iOS_FS/System/Library/Frameworks/CoreMedia.framework/CoreMedia ./CoreMedia
+            hdiutil detach /Volumes/iOS_FS
+            ls -lh CoreMedia
+            file CoreMedia
+          fi
+
+      - name: Extract dyld shared cache and slice CoreMedia
+        run: |
+          # If CoreMedia wasn't extracted via mount, try dsc_extractor from Xcode SDK
+          if [ ! -f CoreMedia ]; then
+            echo "Attempting dyld_shared_cache_extractor approach..."
+            # Find dsc_extractor in Xcode
+            DSC_TOOL=$(find /Applications/Xcode*.app -name "dsc_extractor" 2>/dev/null | head -1)
+            echo "dsc_extractor: $DSC_TOOL"
+
+            # Also check if the SDK ships a pre-extracted CoreMedia we can disassemble
+            SDK_CM=$(find /Applications/Xcode*.app -name "CoreMedia" \
+              -path "*/iphoneos*" -not -name "*.h" 2>/dev/null | head -3)
+            echo "SDK CoreMedia candidates: $SDK_CM"
+            if [ -n "$SDK_CM" ]; then
+              cp $(echo "$SDK_CM" | head -1) ./CoreMedia
+              echo "Using SDK CoreMedia (stripped — symbols may be limited)"
+              ls -lh CoreMedia
+              file CoreMedia
+            fi
+          fi
 
       - name: Dump FigXPCCreateBasicMessage fourcc
         run: |
