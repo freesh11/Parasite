@@ -21,6 +21,7 @@
 #import "FigBridge.h"
 #import <xpc/xpc.h>
 #import <mach/mach.h>
+#import <dirent.h>
 #import <dlfcn.h>
 #import <string.h>
 #import <signal.h>
