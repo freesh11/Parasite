@@ -26,6 +26,7 @@
 #import <string.h>
 #import <signal.h>
 #import <setjmp.h>
+#import <pthread.h>
 
 // xpc_connection_create_mach_service exists on iOS at runtime but the iOS SDK
 // marks it unavailable. Redeclare via a private alias to bypass the SDK guard.
@@ -86,42 +87,64 @@ static struct {
 // fourcc returns a valid xpc_object_t (non-NULL). Log every result so we can
 // read the winning value from the log and hardcode it next build.
 
+// ── fourcc probe — isolated pthread ──────────────────────────────────────────
+// FigXPCCreateBasicMessage crashes inside (NULL vtable) on a wrong fourcc.
+// Using sigsetjmp/siglongjmp with a process-wide SIGSEGV handler is unsafe when
+// other threads (main/CA render) are active — signal can be delivered to the wrong
+// thread and siglongjmp unwinds a stack that isn't ours.
+//
+// Fix: run the probe on a dedicated pthread that explicitly UNBLOCKS SIGSEGV/SIGBUS,
+// while all other threads keep those signals blocked. The OS then delivers any crash
+// signal only to the probe thread, making sigsetjmp/siglongjmp safe.
+
 static sigjmp_buf  sFourccJmp;
 static void        fourccSigHandler(int sig) { siglongjmp(sFourccJmp, 1); }
 
-static uint32_t probeFourcc(PFN_CreateMsg fn) {
-    // Ordered candidates — '.bst' (bytestream) most likely for iOS 27 service name.
-    static const uint32_t kCandidates[] = {
-        0x2e627374u,  // '.bst'  bytestream (iOS 27 service name)
-        0x2e6f7267u,  // '.org'  PoC / pre-iOS-27 confirmed
-        0x62737472u,  // 'bstr'  bytestream
-        0x62797473u,  // 'byts'  bytes
-        0x2e627974u,  // '.byt'
-        0x636d6273u,  // 'cmbs'  CoreMedia bytestream
-        0x2e6d736du,  // '.msm'
-        0x2e737263u,  // '.src'
-        0x2e6d656du,  // '.mem'
-        0x2e726370u,  // '.rcp'
-        0x2e637072u,  // '.cpr'
-        0x2e786d73u,  // '.xms'
-        0x2e786d62u,  // '.xmb'
-        0x2e6d7364u,  // '.msd'
-        0x6d736d00u,  // 'msm\0'
-        0x00000001u,  // minimal sentinel
-    };
+typedef struct { PFN_CreateMsg fn; uint32_t result; } ProbeArgs;
 
-    struct sigaction sa_new = {0}, sa_old;
+static const uint32_t kFourccCandidates[] = {
+    0x2e627374u,  // '.bst'  bytestream (iOS 27 service name)
+    0x2e6f7267u,  // '.org'  PoC / pre-iOS-27 confirmed
+    0x62737472u,  // 'bstr'  bytestream
+    0x62797473u,  // 'byts'  bytes
+    0x2e627974u,  // '.byt'
+    0x636d6273u,  // 'cmbs'  CoreMedia bytestream
+    0x2e6d736du,  // '.msm'
+    0x2e737263u,  // '.src'
+    0x2e6d656du,  // '.mem'
+    0x2e726370u,  // '.rcp'
+    0x2e637072u,  // '.cpr'
+    0x2e786d73u,  // '.xms'
+    0x2e786d62u,  // '.xmb'
+    0x2e6d7364u,  // '.msd'
+    0x6d736d00u,  // 'msm\0'
+    0x00000001u,  // minimal sentinel
+};
+
+static void *probeThreadFn(void *arg) {
+    ProbeArgs *pa = (ProbeArgs *)arg;
+
+    // Unblock SIGSEGV + SIGBUS on this thread only — all others stay blocked.
+    // The OS delivers the signal here, not to the CA render thread.
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGSEGV);
+    sigaddset(&unblock, SIGBUS);
+    pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+
+    struct sigaction sa_new = {0}, sa_old_segv, sa_old_bus;
     sa_new.sa_handler = fourccSigHandler;
     sa_new.sa_flags   = SA_RESETHAND;
     sigemptyset(&sa_new.sa_mask);
-    sigaction(SIGSEGV, &sa_new, &sa_old);
-    sigaction(SIGBUS,  &sa_new, NULL);
+    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+    sigaction(SIGBUS,  &sa_new, &sa_old_bus);
 
     uint32_t found = 0;
-    for (size_t i = 0; i < sizeof(kCandidates)/sizeof(kCandidates[0]); i++) {
-        uint32_t cc = kCandidates[i];
+    size_t n = sizeof(kFourccCandidates) / sizeof(kFourccCandidates[0]);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t cc = kFourccCandidates[i];
         if (sigsetjmp(sFourccJmp, 1) == 0) {
-            xpc_object_t obj = fn(cc, 0);
+            xpc_object_t obj = pa->fn(cc, 0);
             if (obj) {
                 NSLog(@"[FigBridge] fourcc probe HIT: 0x%08x ('%c%c%c%c')",
                       cc,
@@ -134,20 +157,39 @@ static uint32_t probeFourcc(PFN_CreateMsg fn) {
             }
         } else {
             NSLog(@"[FigBridge] fourcc probe CRASH: 0x%08x", cc);
-            // re-arm after RESETHAND consumed the handler
+            // re-arm: SA_RESETHAND consumed the handler on crash delivery
             sigaction(SIGSEGV, &sa_new, NULL);
             sigaction(SIGBUS,  &sa_new, NULL);
         }
     }
 
-    sigaction(SIGSEGV, &sa_old, NULL);
-    sigaction(SIGBUS,  &sa_old, NULL);
+    sigaction(SIGSEGV, &sa_old_segv, NULL);
+    sigaction(SIGBUS,  &sa_old_bus,  NULL);
 
     if (!found) {
-        NSLog(@"[FigBridge] fourcc probe: no candidate worked, falling back to 0x2e6f7267");
+        NSLog(@"[FigBridge] fourcc probe: no candidate hit, falling back to 0x2e6f7267");
         found = 0x2e6f7267u;
     }
-    return found;
+    pa->result = found;
+    return NULL;
+}
+
+static uint32_t probeFourcc(PFN_CreateMsg fn) {
+    // Block SIGSEGV + SIGBUS on the calling thread (and threads it spawns inherit).
+    // probeThreadFn unblocks them again, so only that thread catches probe crashes.
+    sigset_t block, prev;
+    sigemptyset(&block);
+    sigaddset(&block, SIGSEGV);
+    sigaddset(&block, SIGBUS);
+    pthread_sigmask(SIG_BLOCK, &block, &prev);
+
+    ProbeArgs pa = { fn, 0 };
+    pthread_t thr;
+    pthread_create(&thr, NULL, probeThreadFn, &pa);
+    pthread_join(thr, NULL);
+
+    pthread_sigmask(SIG_SETMASK, &prev, NULL);
+    return pa.result;
 }
 
 static NSError *figErr(int code, NSString *msg) {
