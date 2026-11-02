@@ -166,6 +166,6 @@ extension DiagnosticRunVC: UIPickerViewDataSource, UIPickerViewDelegate {
     }
     func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
         let target = DiagnosticTarget.presets[row]
-        pathField.isHidden = !target.path.isEmpty // show field only for Custom
+        pathField.isHidden = target.path.isEmpty  // hide when preset has a path; show for Custom
     }
 }
