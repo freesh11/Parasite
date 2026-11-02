@@ -158,15 +158,17 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
         }
 
         xpc_object_t msg2 = sendSync(conn, msg1);
-        xpc_release(msg1);
+        // keep msg1 alive — recipCreate takes (outRecip, msg1, msg2), both objects needed
 
         if (!msg2) {
+            xpc_release(msg1);
             err = figErr(7, @"no reply from mediaplaybackd (timeout or service unavailable)");
             goto done;
         }
 
         void *recip = NULL;
-        st = sFig.recipCreate(&recip, msg2, msg2);
+        st = sFig.recipCreate(&recip, msg1, msg2);
+        xpc_release(msg1);
         if (st || !recip) {
             err = figErr(8, [NSString stringWithFormat:@"RecipientCreate status=%d", st]);
             xpc_release(msg2); goto done;
