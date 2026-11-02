@@ -42,12 +42,14 @@ static void _load_xpc_conn(void) {
 #define FIG_TIMEOUT_NS   (10LL * NSEC_PER_SEC)
 
 // ── CoreMedia private symbol typedefs ─────────────────────────────────────────
+// All Fig* message args are xpc_object_t (xpc_dictionary under the hood).
+// Using xpc_object_t directly — no CF bridging, no cast gymnastics.
 
-typedef int32_t (*PFN_CreateMsg)(uint32_t fourcc, uint64_t flags, CFDictionaryRef *outMsg);
-typedef int32_t (*PFN_SetURL)(CFDictionaryRef msg, CFURLRef url);
-typedef int32_t (*PFN_OriginBegin)(void **outOrigin, CFDictionaryRef msg1);
-typedef int32_t (*PFN_RecipCreate)(void **outRecip, CFDictionaryRef msg1, CFDictionaryRef msg2);
-typedef int32_t (*PFN_OriginComplete)(void *origin, CFDictionaryRef msg2);
+typedef int32_t (*PFN_CreateMsg)(uint32_t fourcc, uint64_t flags, xpc_object_t *outMsg);
+typedef int32_t (*PFN_SetURL)(xpc_object_t msg, CFURLRef url);
+typedef int32_t (*PFN_OriginBegin)(void **outOrigin, xpc_object_t msg1);
+typedef int32_t (*PFN_RecipCreate)(void **outRecip, xpc_object_t msg1, xpc_object_t msg2);
+typedef int32_t (*PFN_OriginComplete)(void *origin, xpc_object_t msg2);
 
 static struct {
     PFN_CreateMsg      createMsg;
@@ -123,9 +125,7 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 
     NSData *result = nil;
 
-    // FigXPCCreateBasicMessage returns an xpc_dictionary toll-free bridged to
-    // CFDictionaryRef — safe to cast directly in MRC.
-    CFDictionaryRef msg1 = NULL;
+    xpc_object_t msg1 = NULL;
     int32_t cst = sFig.createMsg(0x2e727031u, 0, &msg1);
     if (cst || !msg1) { err = figErr(4, [NSString stringWithFormat:@"FigXPCCreateBasicMessage status=%d", cst]); goto done; }
 
@@ -133,19 +133,18 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
         int32_t st = sFig.setURL(msg1, (CFURLRef)fileURL);
         if (st) {
             err = figErr(5, [NSString stringWithFormat:@"FigXPCMessageSetCFURL status=%d", st]);
-            CFRelease(msg1); goto done;
+            xpc_release(msg1); goto done;
         }
 
         void *origin = NULL;
         st = sFig.originBegin(&origin, msg1);
         if (st || !origin) {
             err = figErr(6, [NSString stringWithFormat:@"OriginBegin status=%d", st]);
-            CFRelease(msg1); goto done;
+            xpc_release(msg1); goto done;
         }
 
-        // msg1 is an xpc_dictionary under the hood — cast is valid in MRC.
-        xpc_object_t msg2 = sendSync(conn, (xpc_object_t)msg1);
-        CFRelease(msg1);
+        xpc_object_t msg2 = sendSync(conn, msg1);
+        xpc_release(msg1);
 
         if (!msg2) {
             err = figErr(7, @"no reply from mediaplaybackd (timeout or service unavailable)");
@@ -154,16 +153,13 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 
         void *recip = NULL;
         // shortcut: passing msg2 for both args works on iOS 16-26 per PoC behaviour.
-        // cast via void* — xpc_object_t and CFDictionaryRef are toll-free bridged;
-        // bridge keyword unavailable in MRC, so go through void* to silence the warning.
-        CFDictionaryRef msg2cf = (CFDictionaryRef)(void *)msg2;
-        st = sFig.recipCreate(&recip, msg2cf, msg2cf);
+        st = sFig.recipCreate(&recip, msg2, msg2);
         if (st || !recip) {
             err = figErr(8, [NSString stringWithFormat:@"RecipientCreate status=%d", st]);
             xpc_release(msg2); goto done;
         }
 
-        st = sFig.originComplete(origin, msg2cf);
+        st = sFig.originComplete(origin, msg2);
         xpc_release(msg2);
         if (st) { err = figErr(9, [NSString stringWithFormat:@"OriginComplete status=%d", st]); goto done; }
 
