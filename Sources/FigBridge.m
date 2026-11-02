@@ -92,14 +92,20 @@ static void        fourccSigHandler(int sig) { siglongjmp(sFourccJmp, 1); }
 static uint32_t probeFourcc(PFN_CreateMsg fn) {
     // Ordered candidates — '.bst' (bytestream) most likely for iOS 27 service name.
     static const uint32_t kCandidates[] = {
-        0x2e627374u,  // '.bst'  bytestream
-        0x2e6f7267u,  // '.org'  PoC / pre-iOS-27
+        0x2e627374u,  // '.bst'  bytestream (iOS 27 service name)
+        0x2e6f7267u,  // '.org'  PoC / pre-iOS-27 confirmed
+        0x62737472u,  // 'bstr'  bytestream
+        0x62797473u,  // 'byts'  bytes
+        0x2e627974u,  // '.byt'
+        0x636d6273u,  // 'cmbs'  CoreMedia bytestream
         0x2e6d736du,  // '.msm'
         0x2e737263u,  // '.src'
         0x2e6d656du,  // '.mem'
         0x2e726370u,  // '.rcp'
         0x2e637072u,  // '.cpr'
         0x2e786d73u,  // '.xms'
+        0x2e786d62u,  // '.xmb'
+        0x2e6d7364u,  // '.msd'
         0x6d736d00u,  // 'msm\0'
         0x00000001u,  // minimal sentinel
     };
