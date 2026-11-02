@@ -1,0 +1,160 @@
+# .github/workflows/fourcc.yml
+# Extracts CoreMedia from iOS 27.0.1 IPSW without downloading the full 12GB.
+# Uses zip central-directory range-fetch to pull only the root filesystem DMG,
+# mounts it, extracts CoreMedia, disassembles FigXPCCreateBasicMessage,
+# and prints the fourcc loaded into x0.
+#
+# Run manually: Actions → "Probe fourcc" → Run workflow.
+
+name: Probe fourcc
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zipdetails / python zip tools
+        run: pip3 install --quiet requests 2>/dev/null || true
+
+      - name: Fetch IPSW central directory and find root DMG
+        id: find_dmg
+        run: |
+          IPSW_URL="https://updates.cdn-apple.com/2026FallFCS/8cd333d4-1025-4e89-99a2-1373d2b5bfcb/iPhone19,2_27.0.1_24A446_Restore.ipsw"
+          python3 - <<'PYEOF'
+          import struct, urllib.request, sys
+
+          url = "https://updates.cdn-apple.com/2026FallFCS/8cd333d4-1025-4e89-99a2-1373d2b5bfcb/iPhone19,2_27.0.1_24A446_Restore.ipsw"
+
+          # Step 1: get total file size via HEAD
+          req = urllib.request.Request(url, method="HEAD")
+          with urllib.request.urlopen(req) as r:
+              total = int(r.headers["Content-Length"])
+          print(f"IPSW size: {total/1e9:.2f} GB", flush=True)
+
+          # Step 2: fetch last 65536 bytes — contains End of Central Directory
+          tail_size = 65536
+          req = urllib.request.Request(url, headers={"Range": f"bytes={total-tail_size}-{total-1}"})
+          with urllib.request.urlopen(req) as r:
+              tail = r.read()
+
+          # Find EOCD signature
+          eocd_off = tail.rfind(b"PK\x05\x06")
+          if eocd_off < 0:
+              sys.exit("EOCD not found in tail")
+          eocd = tail[eocd_off:]
+          cd_size   = struct.unpack_from("<I", eocd, 12)[0]
+          cd_offset = struct.unpack_from("<I", eocd, 16)[0]
+          print(f"Central directory: offset={cd_offset} size={cd_size}", flush=True)
+
+          # Step 3: fetch central directory
+          req = urllib.request.Request(url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"})
+          with urllib.request.urlopen(req) as r:
+              cd = r.read()
+
+          # Step 4: parse entries, find largest .dmg
+          best = None
+          pos = 0
+          while pos < len(cd):
+              if cd[pos:pos+4] != b"PK\x01\x02":
+                  break
+              comp   = struct.unpack_from("<H", cd, pos+10)[0]
+              csz    = struct.unpack_from("<I", cd, pos+20)[0]
+              usz    = struct.unpack_from("<I", cd, pos+24)[0]
+              nlen   = struct.unpack_from("<H", cd, pos+28)[0]
+              xlen   = struct.unpack_from("<H", cd, pos+30)[0]
+              clen   = struct.unpack_from("<H", cd, pos+32)[0]
+              loff   = struct.unpack_from("<I", cd, pos+42)[0]
+              name   = cd[pos+46:pos+46+nlen].decode("utf-8", errors="replace")
+              if name.endswith(".dmg") and (best is None or usz > best[2]):
+                  best = (name, loff, usz, csz, comp)
+              pos += 46 + nlen + xlen + clen
+
+          if not best:
+              sys.exit("No .dmg found in central directory")
+          name, loff, usz, csz, comp = best
+          print(f"Largest DMG: {name}  uncompressed={usz/1e9:.2f}GB  method={comp}", flush=True)
+
+          # Step 5: fetch local file header to find data offset
+          req = urllib.request.Request(url, headers={"Range": f"bytes={loff}-{loff+299}"})
+          with urllib.request.urlopen(req) as r:
+              lhdr = r.read()
+          if lhdr[:4] != b"PK\x03\x04":
+              sys.exit("Local header signature mismatch")
+          lnlen = struct.unpack_from("<H", lhdr, 26)[0]
+          lxlen = struct.unpack_from("<H", lhdr, 28)[0]
+          data_off = loff + 30 + lnlen + lxlen
+
+          print(f"Data offset: {data_off}  compressed size: {csz}", flush=True)
+          print(f"METHOD={comp}", flush=True)
+          print(f"URL={url}", flush=True)
+          print(f"DATA_OFF={data_off}", flush=True)
+          print(f"DATA_SZ={csz}", flush=True)
+
+          # Write env for next step
+          with open("dmg_info.env", "w") as f:
+              f.write(f"DMG_URL={url}\n")
+              f.write(f"DMG_OFF={data_off}\n")
+              f.write(f"DMG_SZ={csz}\n")
+              f.write(f"DMG_METHOD={comp}\n")
+          PYEOF
+
+      - name: Download root filesystem DMG
+        run: |
+          source dmg_info.env
+          echo "Fetching ${DMG_SZ} bytes at offset ${DMG_OFF}..."
+          END=$(( DMG_OFF + DMG_SZ - 1 ))
+          curl -L --retry 3 --progress-bar \
+            -H "Range: bytes=${DMG_OFF}-${END}" \
+            "$DMG_URL" -o rootfs_raw.bin
+          ls -lh rootfs_raw.bin
+
+          # If stored (method=0), it's raw; if deflated (method=8), decompress
+          if [ "$DMG_METHOD" = "0" ]; then
+            mv rootfs_raw.bin rootfs.dmg
+          else
+            python3 -c "
+          import zlib, sys
+          data = open('rootfs_raw.bin','rb').read()
+          out  = zlib.decompress(data, -15)
+          open('rootfs.dmg','wb').write(out)
+          print(f'Decompressed {len(data)} -> {len(out)} bytes')
+          "
+          fi
+          ls -lh rootfs.dmg
+          file rootfs.dmg
+
+      - name: Mount DMG and extract CoreMedia
+        run: |
+          hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS 2>&1 || \
+            hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS -imagekey diskimage-class=CRawDiskImage
+          cp /Volumes/iOS_FS/System/Library/Frameworks/CoreMedia.framework/CoreMedia ./CoreMedia
+          hdiutil detach /Volumes/iOS_FS
+          ls -lh CoreMedia
+          file CoreMedia
+
+      - name: Dump FigXPCCreateBasicMessage fourcc
+        run: |
+          echo "=== nm offset ==="
+          nm -arch arm64 CoreMedia 2>/dev/null | grep -i FigXPCCreateBasicMessage || true
+
+          echo ""
+          echo "=== disassembly — first 40 instructions ==="
+          # otool -tV with grep for the function, then first 40 lines
+          otool -arch arm64 -tV CoreMedia 2>/dev/null | \
+            awk '/^_FigXPCCreateBasicMessage:/{found=1; count=0} found{print; count++; if(count>=40){exit}}' || true
+
+          echo ""
+          echo "=== movz/movk loading x0 (the fourcc) ==="
+          otool -arch arm64 -tV CoreMedia 2>/dev/null | \
+            awk '/^_FigXPCCreateBasicMessage:/{found=1; count=0} found{count++; if(count>=40)exit; if(/movz|movk/)print}' || true
+
+      - name: Upload CoreMedia binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreMedia-iOS27.0.1
+          path: CoreMedia
+          if-no-files-found: warn
