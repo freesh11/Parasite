@@ -21,10 +21,10 @@
 #import "FigBridge.h"
 #import <xpc/xpc.h>
 #import <mach/mach.h>
-#import <mach-o/loader.h>
-#import <dirent.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <signal.h>
+#import <setjmp.h>
 
 // xpc_connection_create_mach_service exists on iOS at runtime but the iOS SDK
 // marks it unavailable. Redeclare via a private alias to bypass the SDK guard.
@@ -75,62 +75,72 @@ static struct {
     uint32_t           fourcc;   // derived at load time from live CoreMedia __TEXT
 } sFig;
 
-// ── Runtime fourcc derivation ─────────────────────────────────────────────────
-// FigXPCCreateBasicMessage's first arg is a fourcc that selects the XPC message
-// type. The value changed between iOS versions (0x2e6f7267 on older builds,
-// unknown on iOS 27). We scan the 16 instructions before the call site for
-// movz/movk pairs that build x0, reconstruct the constant, and use it.
-// Falls back to 0x2e6f7267 if the scan finds nothing — log will show which.
+// ── Runtime fourcc probe ──────────────────────────────────────────────────────
+// FigXPCCreateBasicMessage selects an internal message type by fourcc.
+// The value changed in iOS 27 CoreMedia (in the dyld shared cache — not
+// scannable at runtime without a jailbreak).
+//
+// Strategy: try each candidate with a SIGSEGV handler. A wrong fourcc causes
+// a NULL-pointer write inside the function (observed crash pattern). A correct
+// fourcc returns a valid xpc_object_t (non-NULL). Log every result so we can
+// read the winning value from the log and hardcode it next build.
 
-static uint32_t deriveFourcc(void *createMsgFn, void *cmBase, size_t cmSize) {
-    // Walk backwards from createMsgFn's xrefs inside CoreMedia __TEXT.
-    // We look for: movz x0,#lo / movk x0,#hi,lsl#16  (or vice-versa).
-    uintptr_t base   = (uintptr_t)cmBase;
-    uintptr_t limit  = base + cmSize;
-    uintptr_t target = (uintptr_t)createMsgFn;
+static sigjmp_buf  sFourccJmp;
+static void        fourccSigHandler(int sig) { siglongjmp(sFourccJmp, 1); }
 
-    uint32_t lo16 = 0, hi16 = 0;
-    BOOL gotLo = NO, gotHi = NO;
+static uint32_t probeFourcc(PFN_CreateMsg fn) {
+    // Ordered candidates — '.bst' (bytestream) most likely for iOS 27 service name.
+    static const uint32_t kCandidates[] = {
+        0x2e627374u,  // '.bst'  bytestream
+        0x2e6f7267u,  // '.org'  PoC / pre-iOS-27
+        0x2e6d736du,  // '.msm'
+        0x2e737263u,  // '.src'
+        0x2e6d656du,  // '.mem'
+        0x2e726370u,  // '.rcp'
+        0x2e637072u,  // '.cpr'
+        0x2e786d73u,  // '.xms'
+        0x6d736d00u,  // 'msm\0'
+        0x00000001u,  // minimal sentinel
+    };
 
-    for (uintptr_t pc = base; pc + 4 <= limit; pc += 4) {
-        uint32_t insn = *(uint32_t *)pc;
+    struct sigaction sa_new = {0}, sa_old;
+    sa_new.sa_handler = fourccSigHandler;
+    sa_new.sa_flags   = SA_RESETHAND;
+    sigemptyset(&sa_new.sa_mask);
+    sigaction(SIGSEGV, &sa_new, &sa_old);
+    sigaction(SIGBUS,  &sa_new, NULL);
 
-        // BL Xn at next instruction — check if this is a call to createMsgFn.
-        // ARM64 BL: bits[31:26]=100101, imm26 relative to PC.
-        if ((insn >> 26) == 0x25) {
-            int32_t imm26 = (int32_t)(insn << 6) >> 6; // sign-extend
-            uintptr_t callee = pc + ((uintptr_t)(int64_t)imm26 << 2);
-            if (callee == target) {
-                // Scan up to 16 instructions backwards for movz/movk into x0.
-                lo16 = 0; hi16 = 0; gotLo = NO; gotHi = NO;
-                for (int back = 1; back <= 16 && pc >= base + (uintptr_t)(back * 4); back++) {
-                    uint32_t prev = *(uint32_t *)(pc - (uintptr_t)(back * 4));
-                    // movz x0,#imm: 1101001000000000 xxxxxxxxxxxxxxxx 00000
-                    //   [31]=1 [30]=1 [29]=0 [28]=1 [27]=0 [26]=0 [25]=1 [24]=0
-                    //   [23:21]=shift/3 [20:5]=imm16 [4:0]=Rd
-                    // movz Xd,#imm,lsl#0:  0xd2800000 | (imm<<5) | Rd
-                    // movk Xd,#imm,lsl#16: 0xf2a00000 | (imm<<5) | Rd
-                    uint32_t Rd = prev & 0x1f;
-                    if (Rd != 0) continue; // x0 only
-                    uint32_t op = prev >> 21;
-                    if (op == (0xd2800000 >> 21)) { // movz x0,#imm,lsl#0
-                        lo16 = (prev >> 5) & 0xffff;
-                        gotLo = YES;
-                    } else if (op == (0xf2a00000 >> 21)) { // movk x0,#imm,lsl#16
-                        hi16 = (prev >> 5) & 0xffff;
-                        gotHi = YES;
-                    }
-                    if (gotLo && gotHi) goto found;
-                }
+    uint32_t found = 0;
+    for (size_t i = 0; i < sizeof(kCandidates)/sizeof(kCandidates[0]); i++) {
+        uint32_t cc = kCandidates[i];
+        if (sigsetjmp(sFourccJmp, 1) == 0) {
+            xpc_object_t obj = fn(cc, 0);
+            if (obj) {
+                NSLog(@"[FigBridge] fourcc probe HIT: 0x%08x ('%c%c%c%c')",
+                      cc,
+                      (cc>>24)&0xff, (cc>>16)&0xff, (cc>>8)&0xff, cc&0xff);
+                xpc_release(obj);
+                found = cc;
+                break;
+            } else {
+                NSLog(@"[FigBridge] fourcc probe NULL: 0x%08x", cc);
             }
+        } else {
+            NSLog(@"[FigBridge] fourcc probe CRASH: 0x%08x", cc);
+            // re-arm after RESETHAND consumed the handler
+            sigaction(SIGSEGV, &sa_new, NULL);
+            sigaction(SIGBUS,  &sa_new, NULL);
         }
     }
 
-found:
-    if (gotLo && gotHi) {
-        return ((uint32_t)hi16 << 16) | lo16;
+    sigaction(SIGSEGV, &sa_old, NULL);
+    sigaction(SIGBUS,  &sa_old, NULL);
+
+    if (!found) {
+        NSLog(@"[FigBridge] fourcc probe: no candidate worked, falling back to 0x2e6f7267");
+        found = 0x2e6f7267u;
     }
-    return 0x2e6f7267u; // fallback: '.org' from PoC disassembly
+    return found;
 }
 
 static NSError *figErr(int code, NSString *msg) {
@@ -161,27 +171,10 @@ static BOOL loadFigSymbols(NSError **outErr) {
              sFig.recipCreate && sFig.originComplete;
 
         if (ok) {
-            // Derive fourcc from live __TEXT rather than hardcoding.
-            Dl_info di; uint32_t fourcc = 0x2e6f7267u;
-            if (dladdr(sFig.createMsg, &di) && di.dli_fbase) {
-                // Use Mach-O header to find __TEXT size.
-                struct mach_header_64 *mh = (struct mach_header_64 *)di.dli_fbase;
-                size_t cmSz = 0;
-                if (mh->magic == MH_MAGIC_64) {
-                    struct load_command *lc = (struct load_command *)((uint8_t *)mh + sizeof(*mh));
-                    for (uint32_t i = 0; i < mh->ncmds; i++) {
-                        if (lc->cmd == LC_SEGMENT_64) {
-                            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
-                            if (memcmp(seg->segname, "__TEXT", 6) == 0) {
-                                cmSz = seg->vmsize; break;
-                            }
-                        }
-                        lc = (struct load_command *)((uint8_t *)lc + lc->cmdsize);
-                    }
-                }
-                if (cmSz) fourcc = deriveFourcc(sFig.createMsg, di.dli_fbase, cmSz);
-            }
-            sFig.fourcc = fourcc;
+            // CoreMedia lives in the dyld shared cache on iOS 27 — __TEXT scan
+            // covers the entire cache (not CoreMedia's slice). Use SIGSEGV probe
+            // to find the valid fourcc at runtime instead.
+            sFig.fourcc = probeFourcc(sFig.createMsg);
         }
     });
     if (!ok && outErr)
