@@ -34,6 +34,9 @@ targets:
       - path: Sources
         excludes:
           - "Info.plist"
+          - "FigBridge.m"
+      - path: Sources/FigBridge.m
+        compilerFlags: "-fno-objc-arc"
     resources:
       - path: Resources
         excludes:
