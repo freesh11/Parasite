@@ -1,10 +1,7 @@
 # .github/workflows/fourcc.yml
 # Extracts CoreMedia from iOS 27.0.1 IPSW without downloading the full 12GB.
-# Uses zip central-directory range-fetch to pull only the root filesystem DMG,
-# mounts it, extracts CoreMedia, disassembles FigXPCCreateBasicMessage,
-# and prints the fourcc loaded into x0.
-#
-# Run manually: Actions → "Probe fourcc" → Run workflow.
+# Uses ZIP64-aware central-directory range-fetch to pull only the root DMG.
+# Run manually: Actions -> "Probe fourcc" -> Run workflow.
 
 name: Probe fourcc
 on:
@@ -17,84 +14,105 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install zipdetails / python zip tools
-        run: pip3 install --quiet requests 2>/dev/null || true
-
       - name: Fetch IPSW central directory and find root DMG
-        id: find_dmg
         run: |
-          IPSW_URL="https://updates.cdn-apple.com/2026FallFCS/8cd333d4-1025-4e89-99a2-1373d2b5bfcb/iPhone19,2_27.0.1_24A446_Restore.ipsw"
-          python3 - <<'PYEOF'
-          import struct, urllib.request, sys
+          python3 << 'PYEOF'
+          import struct, urllib.request, sys, os
 
           url = "https://updates.cdn-apple.com/2026FallFCS/8cd333d4-1025-4e89-99a2-1373d2b5bfcb/iPhone19,2_27.0.1_24A446_Restore.ipsw"
+          Z64 = 0xFFFFFFFF
 
-          # Step 1: get total file size via HEAD
+          def fetch(start, end):
+              req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read()
+
+          # total size
           req = urllib.request.Request(url, method="HEAD")
-          with urllib.request.urlopen(req) as r:
+          with urllib.request.urlopen(req, timeout=30) as r:
               total = int(r.headers["Content-Length"])
           print(f"IPSW size: {total/1e9:.2f} GB", flush=True)
 
-          # Step 2: fetch last 65536 bytes — contains End of Central Directory
-          tail_size = 65536
-          req = urllib.request.Request(url, headers={"Range": f"bytes={total-tail_size}-{total-1}"})
-          with urllib.request.urlopen(req) as r:
-              tail = r.read()
+          # tail — EOCD lives here
+          tail = fetch(total - 65536, total - 1)
 
-          # Find EOCD signature
+          # standard EOCD
           eocd_off = tail.rfind(b"PK\x05\x06")
           if eocd_off < 0:
-              sys.exit("EOCD not found in tail")
+              sys.exit("EOCD not found")
           eocd = tail[eocd_off:]
           cd_size   = struct.unpack_from("<I", eocd, 12)[0]
           cd_offset = struct.unpack_from("<I", eocd, 16)[0]
-          print(f"Central directory: offset={cd_offset} size={cd_size}", flush=True)
 
-          # Step 3: fetch central directory
-          req = urllib.request.Request(url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"})
-          with urllib.request.urlopen(req) as r:
-              cd = r.read()
+          # ZIP64: sentinels mean "look in ZIP64 EOCD"
+          if cd_offset == Z64 or cd_size == Z64:
+              loc = tail.rfind(b"PK\x06\x07")
+              if loc < 0:
+                  sys.exit("ZIP64 EOCD locator not found")
+              z64_abs = struct.unpack_from("<Q", tail, loc + 8)[0]
+              print(f"ZIP64 EOCD at {z64_abs}", flush=True)
+              z64 = fetch(z64_abs, z64_abs + 55)
+              if z64[:4] != b"PK\x06\x06":
+                  sys.exit("ZIP64 EOCD sig mismatch")
+              cd_size   = struct.unpack_from("<Q", z64, 40)[0]
+              cd_offset = struct.unpack_from("<Q", z64, 48)[0]
 
-          # Step 4: parse entries, find largest .dmg
+          print(f"CD offset={cd_offset} size={cd_size}", flush=True)
+
+          # fetch central directory
+          cd = fetch(cd_offset, cd_offset + cd_size - 1)
+
+          # parse entries with ZIP64 extra field support
           best = None
           pos = 0
-          while pos < len(cd):
+          while pos + 46 <= len(cd):
               if cd[pos:pos+4] != b"PK\x01\x02":
                   break
-              comp   = struct.unpack_from("<H", cd, pos+10)[0]
-              csz    = struct.unpack_from("<I", cd, pos+20)[0]
-              usz    = struct.unpack_from("<I", cd, pos+24)[0]
-              nlen   = struct.unpack_from("<H", cd, pos+28)[0]
-              xlen   = struct.unpack_from("<H", cd, pos+30)[0]
-              clen   = struct.unpack_from("<H", cd, pos+32)[0]
-              loff   = struct.unpack_from("<I", cd, pos+42)[0]
-              name   = cd[pos+46:pos+46+nlen].decode("utf-8", errors="replace")
+              comp = struct.unpack_from("<H", cd, pos+10)[0]
+              csz  = struct.unpack_from("<I", cd, pos+20)[0]
+              usz  = struct.unpack_from("<I", cd, pos+24)[0]
+              nlen = struct.unpack_from("<H", cd, pos+28)[0]
+              xlen = struct.unpack_from("<H", cd, pos+30)[0]
+              clen = struct.unpack_from("<H", cd, pos+32)[0]
+              loff = struct.unpack_from("<I", cd, pos+42)[0]
+              name = cd[pos+46:pos+46+nlen].decode("utf-8", errors="replace")
+
+              if Z64 in (usz, csz, loff):
+                  xd = cd[pos+46+nlen : pos+46+nlen+xlen]
+                  xp = 0
+                  while xp + 4 <= len(xd):
+                      tag  = struct.unpack_from("<H", xd, xp)[0]
+                      dlen = struct.unpack_from("<H", xd, xp+2)[0]
+                      if tag == 0x0001:
+                          vals, vp = [], xp + 4
+                          while vp + 8 <= xp + 4 + dlen:
+                              vals.append(struct.unpack_from("<Q", xd, vp)[0]); vp += 8
+                          vi = 0
+                          if usz  == Z64 and vi < len(vals): usz  = vals[vi]; vi += 1
+                          if csz  == Z64 and vi < len(vals): csz  = vals[vi]; vi += 1
+                          if loff == Z64 and vi < len(vals): loff = vals[vi]
+                      xp += 4 + dlen
+
+              print(f"  {name}  usz={usz//1024//1024}MB", flush=True)
               if name.endswith(".dmg") and (best is None or usz > best[2]):
                   best = (name, loff, usz, csz, comp)
               pos += 46 + nlen + xlen + clen
 
           if not best:
-              sys.exit("No .dmg found in central directory")
-          name, loff, usz, csz, comp = best
-          print(f"Largest DMG: {name}  uncompressed={usz/1e9:.2f}GB  method={comp}", flush=True)
+              sys.exit("No .dmg found")
 
-          # Step 5: fetch local file header to find data offset
-          req = urllib.request.Request(url, headers={"Range": f"bytes={loff}-{loff+299}"})
-          with urllib.request.urlopen(req) as r:
-              lhdr = r.read()
+          name, loff, usz, csz, comp = best
+          print(f"\nTarget: {name}  {usz/1e9:.2f}GB  method={comp}", flush=True)
+
+          # local file header -> actual data start
+          lhdr = fetch(loff, loff + 299)
           if lhdr[:4] != b"PK\x03\x04":
-              sys.exit("Local header signature mismatch")
+              sys.exit("LFH sig mismatch")
           lnlen = struct.unpack_from("<H", lhdr, 26)[0]
           lxlen = struct.unpack_from("<H", lhdr, 28)[0]
           data_off = loff + 30 + lnlen + lxlen
+          print(f"Data offset: {data_off}  csz: {csz}", flush=True)
 
-          print(f"Data offset: {data_off}  compressed size: {csz}", flush=True)
-          print(f"METHOD={comp}", flush=True)
-          print(f"URL={url}", flush=True)
-          print(f"DATA_OFF={data_off}", flush=True)
-          print(f"DATA_SZ={csz}", flush=True)
-
-          # Write env for next step
           with open("dmg_info.env", "w") as f:
               f.write(f"DMG_URL={url}\n")
               f.write(f"DMG_OFF={data_off}\n")
@@ -105,23 +123,22 @@ jobs:
       - name: Download root filesystem DMG
         run: |
           source dmg_info.env
-          echo "Fetching ${DMG_SZ} bytes at offset ${DMG_OFF}..."
+          echo "Fetching ${DMG_SZ} bytes at offset ${DMG_OFF} (method=${DMG_METHOD})..."
           END=$(( DMG_OFF + DMG_SZ - 1 ))
           curl -L --retry 3 --progress-bar \
             -H "Range: bytes=${DMG_OFF}-${END}" \
             "$DMG_URL" -o rootfs_raw.bin
           ls -lh rootfs_raw.bin
 
-          # If stored (method=0), it's raw; if deflated (method=8), decompress
           if [ "$DMG_METHOD" = "0" ]; then
             mv rootfs_raw.bin rootfs.dmg
           else
             python3 -c "
           import zlib, sys
-          data = open('rootfs_raw.bin','rb').read()
-          out  = zlib.decompress(data, -15)
+          d = open('rootfs_raw.bin','rb').read()
+          out = zlib.decompress(d, -15)
           open('rootfs.dmg','wb').write(out)
-          print(f'Decompressed {len(data)} -> {len(out)} bytes')
+          print(f'Decompressed {len(d)} -> {len(out)} bytes')
           "
           fi
           ls -lh rootfs.dmg
@@ -129,8 +146,9 @@ jobs:
 
       - name: Mount DMG and extract CoreMedia
         run: |
-          hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS 2>&1 || \
-            hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS -imagekey diskimage-class=CRawDiskImage
+          hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS || \
+            hdiutil attach rootfs.dmg -readonly -nobrowse -mountpoint /Volumes/iOS_FS \
+              -imagekey diskimage-class=CRawDiskImage
           cp /Volumes/iOS_FS/System/Library/Frameworks/CoreMedia.framework/CoreMedia ./CoreMedia
           hdiutil detach /Volumes/iOS_FS
           ls -lh CoreMedia
@@ -138,19 +156,18 @@ jobs:
 
       - name: Dump FigXPCCreateBasicMessage fourcc
         run: |
-          echo "=== nm offset ==="
+          echo "=== nm ==="
           nm -arch arm64 CoreMedia 2>/dev/null | grep -i FigXPCCreateBasicMessage || true
 
           echo ""
-          echo "=== disassembly — first 40 instructions ==="
-          # otool -tV with grep for the function, then first 40 lines
+          echo "=== first 40 instructions ==="
           otool -arch arm64 -tV CoreMedia 2>/dev/null | \
-            awk '/^_FigXPCCreateBasicMessage:/{found=1; count=0} found{print; count++; if(count>=40){exit}}' || true
+            awk '/^_FigXPCCreateBasicMessage:/{f=1;n=0} f{print;n++; if(n>=40)exit}' || true
 
           echo ""
-          echo "=== movz/movk loading x0 (the fourcc) ==="
+          echo "=== movz/movk into x0 (the fourcc load) ==="
           otool -arch arm64 -tV CoreMedia 2>/dev/null | \
-            awk '/^_FigXPCCreateBasicMessage:/{found=1; count=0} found{count++; if(count>=40)exit; if(/movz|movk/)print}' || true
+            awk '/^_FigXPCCreateBasicMessage:/{f=1;n=0} f{n++; if(n>=40)exit; if(/movz|movk/)print}' || true
 
       - name: Upload CoreMedia binary
         uses: actions/upload-artifact@v4
